@@ -105,7 +105,34 @@ AI_FRONTMATTER_KEYS = frozenset(
 
 AI_META_NAME_RE = re.compile(
     r"generator|ai[-_ ]?generated|claude|anthropic|openai|gemini|synthid|"
-    r"c2pa|content.?credential|provenance|digital.?source|aigc",
+    r"c2pa|content.?credential|provenance|digital.?source|aigc|"
+    # Provenance-phrase keys -- `generated-with:`, `made_with:`, `written-by:`.
+    # These must match on the KEY, because the narrowed value pattern below no
+    # longer catches them via a bare vendor name in the value.
+    r"(?:generated|created|made|written|produced|authored)[-_ ]?(?:with|by|using)",
+    re.I,
+)
+
+# Frontmatter *values* need a tighter pattern than keys do.
+#
+# AI_META_NAME_RE matches a bare vendor name, which is right for a key -- a key
+# literally called `claude:` is provenance -- and badly wrong for a value, where
+# a vendor name is ordinary content. The case that forced this: a Claude Code
+# subagent definition carries
+#
+#     tools: Read, Write, mcp__claude_ai_acme__mail__get-message
+#
+# and the substring "claude" made `tools` a value hit. Because clean_markdown
+# drops the *whole key* on a value hit, cleaning such a file silently deletes
+# the agent's tool grant -- turning a cosmetic scan into data loss on every
+# `.claude/agents/*.md` in a repo.
+#
+# So a value only counts as provenance when it says something provenance-shaped:
+# "AI-generated", a watermark scheme, or an explicit "generated with <vendor>".
+# Naming a vendor is not a claim about how the file was made.
+AI_META_VALUE_RE = re.compile(
+    r"ai[-_ ]?generated|synthid|c2pa|content.?credential|digital.?source|aigc|provenance|"
+    r"(?:generated|created|written|produced|authored)\s+(?:with|by|using)\b",
     re.I,
 )
 
@@ -431,6 +458,25 @@ def _parse_simple_yaml_keys(block: str) -> list[tuple[str, str, int]]:
     return rows
 
 
+# Frontmatter keys that are Claude Code agent/skill *configuration* and happen
+# to collide with provenance key names. `model:` is in AI_FRONTMATTER_KEYS --
+# correct for a generated document, wrong for `.claude/agents/*.md`, where
+# dropping it silently changes which model the agent runs on.
+_AGENT_CONFIG_KEYS = frozenset({"model", "tools", "allowed-tools", "name", "description"})
+
+# The shape that identifies such a file without needing its path: a name, a
+# description, and a tool grant. Ordinary prose frontmatter does not carry all
+# three, so this does not hand a real watermark a way to exempt itself -- and
+# values are still checked, so `description: Generated with Claude Code` inside
+# an agent definition is still caught.
+_AGENT_SHAPE_REQUIRED = ({"name"}, {"description"}, {"tools", "allowed-tools"})
+
+
+def _is_agent_frontmatter(keys: list[str]) -> bool:
+    lowered = {k.lower() for k in keys}
+    return all(group & lowered for group in _AGENT_SHAPE_REQUIRED)
+
+
 def inspect_markdown(text: str) -> tuple[bool, bool, list[str], dict]:
     findings: list[str] = []
     has_ai = False
@@ -440,14 +486,19 @@ def inspect_markdown(text: str) -> tuple[bool, bool, list[str], dict]:
     if m:
         has_fm = True
         block = m.group(1)
-        for key, _line, _i in _parse_simple_yaml_keys(block):
+        rows = _parse_simple_yaml_keys(block)
+        is_agent = _is_agent_frontmatter([k for k, _l, _i in rows])
+        for key, _line, _i in rows:
             keys.append(key)
-            if key.lower() in AI_FRONTMATTER_KEYS or AI_META_NAME_RE.search(key):
+            if is_agent and key.lower() in _AGENT_CONFIG_KEYS:
+                pass  # agent configuration, not provenance -- value still checked below
+            elif key.lower() in AI_FRONTMATTER_KEYS or AI_META_NAME_RE.search(key):
                 has_ai = True
                 findings.append(f"frontmatter key: {key}")
-            # also check value
+            # also check value -- against the narrower value pattern, so a key
+            # whose value merely names a vendor is not treated as provenance.
             val = _line.split(":", 1)[1] if ":" in _line else ""
-            if AI_META_NAME_RE.search(val):
+            if AI_META_VALUE_RE.search(val):
                 has_ai = True
                 findings.append(f"frontmatter value hit on {key}")
 
@@ -470,6 +521,9 @@ def clean_markdown(text: str) -> tuple[str, list[str]]:
         body = text[m.end() :]
         kept: list[str] = []
         dropping = False  # inside the nested block of a dropped top-level key
+        # Must agree with inspect_markdown, or clean would delete what inspect
+        # said was fine -- the two are contracted to predict each other.
+        is_agent = _is_agent_frontmatter([k for k, _l, _i in _parse_simple_yaml_keys(block)])
         for line in block.splitlines():
             stripped = line.strip()
 
@@ -493,11 +547,13 @@ def clean_markdown(text: str) -> tuple[str, list[str]]:
 
             key = km.group(1)
             val = line.split(":", 1)[1] if ":" in line else ""
-            if key.lower() in AI_FRONTMATTER_KEYS or AI_META_NAME_RE.search(key):
+            if is_agent and key.lower() in _AGENT_CONFIG_KEYS:
+                pass  # agent configuration -- fall through to the value check
+            elif key.lower() in AI_FRONTMATTER_KEYS or AI_META_NAME_RE.search(key):
                 actions.append(f"drop frontmatter key: {key}")
                 dropping = True
                 continue
-            if AI_META_NAME_RE.search(val):
+            if AI_META_VALUE_RE.search(val):
                 actions.append(f"drop frontmatter key (value hit): {key}")
                 dropping = True
                 continue
